@@ -140,7 +140,6 @@ async def extract_detailed_metadata(
     media_obj = message.document or message.video
     file_size_bytes = media_obj.file_size or 0
     
-    # Safe duration extraction across both Video and Document Telegram media objects
     duration_sec = 0
     if message.video:
         duration_sec = getattr(message.video, 'duration', 0) or 0
@@ -196,11 +195,28 @@ async def extract_detailed_metadata(
                     if den != "0":
                         fps_val = str(round(float(num) / float(den), 2))
 
+                # Extract Color Depth explicitly
+                pix_fmt = stream.get("pix_fmt", "Unknown")
+                color_depth = stream.get("bits_per_raw_sample")
+                
+                if not color_depth and pix_fmt != "Unknown":
+                    if "10" in pix_fmt:
+                        color_depth = "10-bit"
+                    elif "12" in pix_fmt:
+                        color_depth = "12-bit"
+                    else:
+                        color_depth = "8-bit"
+                elif color_depth:
+                    color_depth = f"{color_depth}-bit"
+                else:
+                    color_depth = "Unknown"
+
                 extracted["video_streams"].append({
                     "codec": stream.get("codec_name", "Unknown").upper(),
                     "resolution": f"{stream.get('width', '?')}x{stream.get('height', '?')}",
                     "fps": fps_val,
-                    "pix_fmt": stream.get("pix_fmt", "Unknown")
+                    "pix_fmt": pix_fmt,
+                    "color_depth": color_depth
                 })
                 
             elif st_type == "audio":
@@ -242,7 +258,8 @@ def generate_pdf_report(candidates_data: list, output_path: str):
         
         if item["video_streams"]:
             for v_idx, v in enumerate(item["video_streams"], start=1):
-                story.append(Paragraph(f"• <b>Video Stream #{v_idx}:</b> Codec: {v['codec']} | Resolution: {v['resolution']} | FPS: {v['fps']} | Color: {v['pix_fmt']}", normal_text))
+                # Now explicitly outputs Color Depth alongside pixel format
+                story.append(Paragraph(f"• <b>Video Stream #{v_idx}:</b> Codec: {v['codec']} | Resolution: {v['resolution']} | FPS: {v['fps']} | Color Depth: {v['color_depth']} ({v['pix_fmt']})", normal_text))
         else:
             story.append(Paragraph("• <b>Video Stream:</b> Not detected in header", normal_text))
             
@@ -259,7 +276,7 @@ def generate_pdf_report(candidates_data: list, output_path: str):
     console.print(f"[bold green][LAYER 3 PDF GENERATED][/bold green] Report saved to: [white]{output_path}[/white]")
 
 # ==========================================
-# Layer 4: Gemini AI Engine
+# Layer 4: Async Gemini AI Engine with Exponential Backoff
 # ==========================================
 class CandidateEvaluation(BaseModel):
     winning_message_id: int
@@ -267,47 +284,62 @@ class CandidateEvaluation(BaseModel):
     merit_summary: str
     discard_reasons: list[str]
 
-def evaluate_candidates(pdf_path: str, target_lang: str, target_device: str) -> CandidateEvaluation:
+async def evaluate_candidates(pdf_path: str, target_lang: str, target_device: str) -> CandidateEvaluation:
     console.print(f"[bold cyan][LAYER 4 GEMINI][/bold cyan] Uploading PDF to Gemini 3.6 Flash...")
-    try:
-        client = genai.Client()
-        uploaded_file = client.files.upload(file=pdf_path)
-        prompt = f"""
-        You are an expert video quality evaluator. Analyze the attached itemized PDF report.
-        
-        Selection Rules:
-        1. Language Filter: Match language '{target_lang}'. Convert target language to ISO-639 codes (e.g., 'malayalam' maps to 'mal', 'may'). Reject files without matching language. Return winning_message_id = -1 if none match.
-        2. Playback Match: Pick the optimal file for device '{target_device}' using Video Codec, Resolution, FPS, Bitrate, and Audio Channels.
-        
-        Return response conforming strictly to the requested JSON schema.
-        """
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[uploaded_file, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=CandidateEvaluation,
-            ),
-        )
-        res_data = CandidateEvaluation.model_validate_json(response.text)
-        
-        console.print(Panel(
-            f"[bold cyan]Winner Msg ID:[/] [gold1]{res_data.winning_message_id}[/gold1]\n"
-            f"[bold cyan]Winner File:[/] {res_data.selected_file_name}\n"
-            f"[bold cyan]Merit Summary:[/] {res_data.merit_summary}\n"
-            f"[bold cyan]Discards:[/] {', '.join(res_data.discard_reasons)}",
-            title="[bold green][LAYER 4 EVALUATION COMPLETE][/bold green]",
-            expand=False
-        ))
-        return res_data
-    except Exception as e:
-        console.print(f"[bold red][LAYER 4 ERROR][/bold red] Gemini evaluation failed: {e}")
-        return CandidateEvaluation(
-            winning_message_id=-1,
-            selected_file_name="None",
-            merit_summary="API evaluation error occurred.",
-            discard_reasons=[str(e)],
-        )
+    client = genai.Client()
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # Running synchronous API calls in a separate thread to prevent event loop blocking
+            uploaded_file = await asyncio.to_thread(client.files.upload, file=pdf_path)
+            prompt = f"""
+            You are an expert video quality evaluator. Analyze the attached itemized PDF report.
+            
+            Selection Rules:
+            1. Language Filter: Match language '{target_lang}'. Convert target language to ISO-639 codes (e.g., 'malayalam' maps to 'mal', 'may'). Reject files without matching language. Return winning_message_id = -1 if none match.
+            2. Playback Match: Pick the optimal file for device '{target_device}' using Video Codec, Resolution, FPS, Bitrate, Color Depth, and Audio Channels.
+            
+            Return response conforming strictly to the requested JSON schema.
+            """
+            
+            # Using to_thread for the synchronous generation call
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-3.6-flash",
+                contents=[uploaded_file, prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CandidateEvaluation,
+                )
+            )
+            
+            res_data = CandidateEvaluation.model_validate_json(response.text)
+            console.print(Panel(
+                f"[bold cyan]Winner Msg ID:[/] [gold1]{res_data.winning_message_id}[/gold1]\n"
+                f"[bold cyan]Winner File:[/] {res_data.selected_file_name}\n"
+                f"[bold cyan]Merit Summary:[/] {res_data.merit_summary}\n"
+                f"[bold cyan]Discards:[/] {', '.join(res_data.discard_reasons)}",
+                title="[bold green][LAYER 4 EVALUATION COMPLETE][/bold green]",
+                expand=False
+            ))
+            return res_data
+
+        except Exception as e:
+            error_msg = str(e)
+            if "503" in error_msg and attempt < max_retries - 1:
+                delay = 2 ** attempt * 5
+                console.print(f"[bold yellow][LAYER 4 WARN][/bold yellow] Gemini API 503 Overloaded. Retrying in {delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(delay)
+            else:
+                console.print(f"[bold red][LAYER 4 ERROR][/bold red] Gemini evaluation failed: {e}")
+                # -999 explicitly signifies API crash, rather than -1 (No matching files)
+                return CandidateEvaluation(
+                    winning_message_id=-999,
+                    selected_file_name="None",
+                    merit_summary="API evaluation error occurred after retries.",
+                    discard_reasons=[error_msg],
+                )
 
 # ==========================================
 # Layer 5: Pipeline Execution
@@ -367,21 +399,23 @@ async def handle_end(client: Client, message: Message):
     # Layer 3 Execution
     generate_pdf_report(candidates_metadata, pdf_path)
 
-    # Send report copy to Telegram chat
     try:
         await client.send_document(chat_id, document=pdf_path, caption="Audit Matrix Itemized Report")
         console.print(f"[bold green][LAYER 3 TELEGRAM][/bold green] Sent PDF copy to chat")
     except Exception as pdf_err:
         console.print(f"[bold yellow][LAYER 3 WARN][/bold yellow] Could not send PDF to Telegram: {pdf_err}")
 
-    # Layer 4 Execution
-    eval_result = evaluate_candidates(pdf_path, state.language, state.device)
+    # Layer 4 Execution is now asynchronous
+    eval_result = await evaluate_candidates(pdf_path, state.language, state.device)
 
-    # Layer 5 Processing - Purge non-winners & Send explicit Winner Message
+    # Layer 5 Processing - Dedicated Error codes prevent false "No language match" notifications
     try:
-        if eval_result.winning_message_id == -1:
+        if eval_result.winning_message_id == -999:
+            await message.reply_text("Evaluation failed due to Google Gemini API being temporarily overloaded. Please try again.")
+            console.print("[bold red][LAYER 5 RESULT][/bold red] API Failure. Process aborted.")
+        elif eval_result.winning_message_id == -1:
             await message.reply_text(f"No candidates contained matching language: {state.language}")
-            console.print(f"[bold red][LAYER 5 RESULT][/bold red] No valid candidates found for language: {state.language}")
+            console.print(f"[bold yellow][LAYER 5 RESULT][/bold yellow] No valid candidates found for language: {state.language}")
         else:
             for msg in state.buffered_messages:
                 if msg.id == eval_result.winning_message_id:
