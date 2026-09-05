@@ -140,8 +140,18 @@ async def extract_detailed_metadata(
     media_obj = message.document or message.video
     file_size_bytes = media_obj.file_size or 0
     
-    # Extract duration directly from Telegram media API metadata
-    duration_sec = getattr(media_obj, 'duration', 0) or 0
+    # Safe duration extraction across both Video and Document Telegram media objects
+    duration_sec = 0
+    if message.video:
+        duration_sec = getattr(message.video, 'duration', 0) or 0
+    elif message.document:
+        duration_sec = getattr(message.document, 'duration', 0) or 0
+        if not duration_sec and hasattr(message.document, 'attributes'):
+            for attr in message.document.attributes:
+                if hasattr(attr, 'duration'):
+                    duration_sec = getattr(attr, 'duration', 0) or 0
+                    break
+
     overall_bitrate = int((file_size_bytes * 8) / (duration_sec * 1000)) if duration_sec > 0 else 0
 
     extracted = {
@@ -375,7 +385,6 @@ async def handle_end(client: Client, message: Message):
         else:
             for msg in state.buffered_messages:
                 if msg.id == eval_result.winning_message_id:
-                    # Send evaluation result as an explicit new reply message
                     summary_msg = (
                         f"🏆 **Winner Media Selected**\n\n"
                         f"**File:** `{eval_result.selected_file_name}`\n\n"
