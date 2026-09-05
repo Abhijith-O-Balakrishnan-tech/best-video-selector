@@ -1,0 +1,5 @@
+.env
+*.session
+venv/
+reports/
+__pycache__/
